@@ -1,0 +1,6 @@
+flask==3.1.1
+flask-cors==5.0.1
+gunicorn==23.0.0
+groq==0.13.1
+yt-dlp==2025.1.15
+pydub==0.25.1
