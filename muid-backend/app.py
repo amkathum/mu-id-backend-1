@@ -142,10 +142,15 @@ def download_youtube_audio(url: str, tmp_dir: Path) -> Path:
                 "preferredcodec": "mp3",
             }
         ],
-        "extractor_args": {"youtube": {"player_client": ["ios", "web"]}},
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
         "nocheckcertificate": True,
-        "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
+        "ignoreerrors": False,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
