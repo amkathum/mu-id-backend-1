@@ -149,15 +149,20 @@ def to_latex(transcription: str, client: Groq) -> dict:
     """Convert transcription text to LaTeX via Groq LLaMA."""
     text = transcription[:MAX_LATEX_CHARS] if len(transcription) > MAX_LATEX_CHARS else transcription
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Transcription:\n\n{text}"},
-        ],
-        temperature=0.3,
-        max_tokens=8192,
-    )
+    print("[latex] starting conversion...")
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": LATEX_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Transcription:\n\n{text}"},
+            ],
+            temperature=0.3,
+            max_tokens=8192,
+        )
+    except Exception as e:
+        print(f"[latex] error: {e}")
+        raise
 
     content = response.choices[0].message.content or ""
     subject = ""
@@ -169,6 +174,7 @@ def to_latex(transcription: str, client: Groq) -> dict:
     else:
         latex = content
 
+    print(f"[latex] done, length={len(latex)}")
     return {"subject": subject, "latex": latex}
 
 
