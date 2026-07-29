@@ -142,6 +142,8 @@ def download_youtube_audio(url: str, tmp_dir: Path) -> Path:
                 "preferredcodec": "mp3",
             }
         ],
+        "extractor_args": {"youtube": {"player_client": ["ios", "web"]}},
+        "nocheckcertificate": True,
         "quiet": True,
         "no_warnings": True,
     }
