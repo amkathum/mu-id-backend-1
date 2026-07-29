@@ -2,6 +2,8 @@ import os
 import uuid
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from flask import Flask, request, jsonify
@@ -17,8 +19,9 @@ CORS(app, origins="*")
 # Configuration
 # ---------------------------------------------------------------------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-MAX_CHUNK_MS = 8 * 60 * 1000          # 8 minutes in milliseconds
-MAX_LATEX_CHARS = 8000                  # max chars sent to LLaMA per batch
+MAX_CHUNK_MS = 8 * 60 * 1000   # 8 minutes in milliseconds
+MAX_LATEX_CHARS = 8000           # max chars sent to LLaMA per call
+JOB_TTL = 3600                   # seconds before a completed job is purged (1 hour)
 
 LATEX_SYSTEM_PROMPT = """\
 You are an expert Arabic academic typesetter.
@@ -43,7 +46,50 @@ LaTeX requirements:
 """
 
 # ---------------------------------------------------------------------------
-# Helpers
+# In-memory job store
+# ---------------------------------------------------------------------------
+jobs: dict[str, dict] = {}
+jobs_lock = threading.Lock()
+
+
+def _new_job() -> str:
+    """Create a new job entry and return its ID."""
+    job_id = uuid.uuid4().hex
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "processing",
+            "created_at": time.time(),
+        }
+    return job_id
+
+
+def _finish_job(job_id: str, result: dict) -> None:
+    with jobs_lock:
+        jobs[job_id].update({"status": "done", **result})
+
+
+def _fail_job(job_id: str, message: str) -> None:
+    with jobs_lock:
+        jobs[job_id].update({"status": "error", "message": message})
+
+
+def _cleanup_loop() -> None:
+    """Background thread: purge jobs older than JOB_TTL every 10 minutes."""
+    while True:
+        time.sleep(600)
+        cutoff = time.time() - JOB_TTL
+        with jobs_lock:
+            expired = [jid for jid, j in jobs.items() if j["created_at"] < cutoff]
+            for jid in expired:
+                del jobs[jid]
+
+
+# Start the cleanup daemon immediately
+_cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
+_cleanup_thread.start()
+
+# ---------------------------------------------------------------------------
+# Audio / transcription helpers
 # ---------------------------------------------------------------------------
 
 
@@ -96,15 +142,11 @@ def transcribe_file(audio_path: Path, client: Groq) -> str:
 
 def transcribe_chunks(chunks: list[Path], client: Groq) -> str:
     """Transcribe each chunk and join results."""
-    parts = []
-    for chunk in chunks:
-        parts.append(transcribe_file(chunk, client))
-    return "\n".join(parts)
+    return "\n".join(transcribe_file(c, client) for c in chunks)
 
 
 def to_latex(transcription: str, client: Groq) -> dict:
     """Convert transcription text to LaTeX via Groq LLaMA."""
-    # Process in batches if text is very long
     text = transcription[:MAX_LATEX_CHARS] if len(transcription) > MAX_LATEX_CHARS else transcription
 
     response = client.chat.completions.create(
@@ -118,7 +160,6 @@ def to_latex(transcription: str, client: Groq) -> dict:
     )
 
     content = response.choices[0].message.content or ""
-
     subject = ""
     latex = ""
     if "SUBJECT:" in content and "LATEX:" in content:
@@ -155,10 +196,8 @@ def download_youtube_audio(url: str, tmp_dir: Path) -> Path:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-    # Find the downloaded MP3 (extension may vary before postprocessing)
     mp3_files = list(tmp_dir.glob("audio.mp3"))
     if not mp3_files:
-        # fallback: any audio file in tmp_dir
         candidates = list(tmp_dir.iterdir())
         if not candidates:
             raise FileNotFoundError("yt-dlp did not produce an output file.")
@@ -173,24 +212,45 @@ def process_audio(audio_path: Path, tmp_dir: Path) -> dict:
 
     client = Groq(api_key=GROQ_API_KEY)
 
-    # Compress
     compressed = tmp_dir / "compressed.mp3"
     compress_audio(audio_path, compressed)
 
-    # Chunk
     chunks = chunk_audio(compressed, tmp_dir)
-
-    # Transcribe
     transcription = transcribe_chunks(chunks, client)
-
-    # LaTeX
     latex_result = to_latex(transcription, client)
 
     return {
-        "transcription": transcription,
+        "transcript": transcription,
         "subject": latex_result["subject"],
         "latex": latex_result["latex"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Background workers
+# ---------------------------------------------------------------------------
+
+
+def _run_youtube_job(job_id: str, youtube_url: str) -> None:
+    tmp_dir = make_tmp()
+    try:
+        audio_path = download_youtube_audio(youtube_url, tmp_dir)
+        result = process_audio(audio_path, tmp_dir)
+        _finish_job(job_id, result)
+    except Exception as exc:
+        _fail_job(job_id, str(exc))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _run_upload_job(job_id: str, audio_path: Path, tmp_dir: Path) -> None:
+    try:
+        result = process_audio(audio_path, tmp_dir)
+        _finish_job(job_id, result)
+    except Exception as exc:
+        _fail_job(job_id, str(exc))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -205,29 +265,27 @@ def health():
 
 @app.route("/api/transcribe", methods=["POST"])
 def transcribe_youtube():
-    """Accept a YouTube URL, download, transcribe, and return LaTeX."""
+    """Kick off a background YouTube transcription job; return job_id immediately."""
     data = request.get_json(silent=True) or {}
     youtube_url = data.get("youtube_url", "").strip()
 
     if not youtube_url:
         return jsonify({"error": "youtube_url is required"}), 400
 
-    tmp_dir = make_tmp()
-    try:
-        audio_path = download_youtube_audio(youtube_url, tmp_dir)
-        result = process_audio(audio_path, tmp_dir)
-        return jsonify(result)
-    except EnvironmentError as e:
-        return jsonify({"error": str(e)}), 503
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    job_id = _new_job()
+    thread = threading.Thread(
+        target=_run_youtube_job,
+        args=(job_id, youtube_url),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"job_id": job_id, "status": "processing"}), 202
 
 
 @app.route("/api/upload", methods=["POST"])
 def upload_audio():
-    """Accept a multipart audio file upload, transcribe, and return LaTeX."""
+    """Kick off a background upload transcription job; return job_id immediately."""
     if "file" not in request.files:
         return jsonify({"error": "No file part in request"}), 400
 
@@ -236,19 +294,45 @@ def upload_audio():
         return jsonify({"error": "Empty filename"}), 400
 
     tmp_dir = make_tmp()
-    try:
-        suffix = Path(uploaded.filename).suffix or ".mp3"
-        audio_path = tmp_dir / f"upload{suffix}"
-        uploaded.save(str(audio_path))
+    suffix = Path(uploaded.filename).suffix or ".mp3"
+    audio_path = tmp_dir / f"upload{suffix}"
+    uploaded.save(str(audio_path))
 
-        result = process_audio(audio_path, tmp_dir)
-        return jsonify(result)
-    except EnvironmentError as e:
-        return jsonify({"error": str(e)}), 503
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    job_id = _new_job()
+    thread = threading.Thread(
+        target=_run_upload_job,
+        args=(job_id, audio_path, tmp_dir),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"job_id": job_id, "status": "processing"}), 202
+
+
+@app.route("/api/status/<job_id>", methods=["GET"])
+def job_status(job_id: str):
+    """Poll for job results."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+    if job is None:
+        return jsonify({"error": "Job not found"}), 404
+
+    status = job["status"]
+
+    if status == "processing":
+        return jsonify({"status": "processing"})
+
+    if status == "done":
+        return jsonify({
+            "status": "done",
+            "transcript": job.get("transcript", ""),
+            "subject": job.get("subject", ""),
+            "latex": job.get("latex", ""),
+        })
+
+    # status == "error"
+    return jsonify({"status": "error", "message": job.get("message", "Unknown error")})
 
 
 # ---------------------------------------------------------------------------
