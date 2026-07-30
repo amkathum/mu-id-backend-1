@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import threading
 import time
+import math
 from pathlib import Path
 
 from flask import Flask, request, jsonify
@@ -20,7 +21,7 @@ CORS(app, origins="*")
 # ---------------------------------------------------------------------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_CHUNK_MS = 8 * 60 * 1000   # 8 minutes in milliseconds
-MAX_LATEX_CHARS = 5000           # max chars sent to LLaMA per call
+MAX_LATEX_CHARS = 3000           # max chars sent to LLaMA per call
 JOB_TTL = 7200                   # seconds before a completed job is purged (2 hours)
 
 LATEX_SYSTEM_PROMPT = """\
@@ -57,7 +58,6 @@ def _new_job() -> str:
     job_id = uuid.uuid4().hex
     cutoff = time.time() - JOB_TTL
     with jobs_lock:
-        # Inline cleanup: remove jobs older than JOB_TTL
         expired = [jid for jid, j in jobs.items() if j["created_at"] < cutoff]
         for jid in expired:
             del jobs[jid]
@@ -92,7 +92,6 @@ def _cleanup_loop() -> None:
                 del jobs[jid]
 
 
-# Start the cleanup daemon immediately
 _cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
 _cleanup_thread.start()
 
@@ -215,8 +214,10 @@ def _extract_body(latex_doc: str) -> str:
 def to_latex(transcription: str, client: Groq) -> dict:
     """Convert transcription to LaTeX.
 
-    If the transcript exceeds MAX_LATEX_CHARS it is split into two halves,
-    each converted separately, then merged into one document.
+    If the transcript exceeds MAX_LATEX_CHARS it is split into N parts
+    (each roughly MAX_LATEX_CHARS long), converted separately, then merged
+    into one document. A short delay between calls avoids Groq's
+    tokens-per-minute rate limit.
     """
     print(f"[latex] transcript length={len(transcription)}, MAX_LATEX_CHARS={MAX_LATEX_CHARS}")
 
@@ -235,49 +236,56 @@ def to_latex(transcription: str, client: Groq) -> dict:
         print(f"[latex] done (single-pass), length={len(latex)}")
         return {"subject": subject, "latex": latex}
 
-    # ── Two-pass (long transcript) ───────────────────────────────────────────
-    mid = len(transcription) // 2
-    part1 = transcription[:mid]
-    part2 = transcription[mid:]
-    print(f"[latex] long transcript — splitting into 2 parts ({len(part1)}, {len(part2)} chars)")
+    # ── Multi-pass (long transcript) ─────────────────────────────────────────
+    num_parts = math.ceil(len(transcription) / MAX_LATEX_CHARS)
+    part_size = math.ceil(len(transcription) / num_parts)
+    parts = [transcription[i:i + part_size] for i in range(0, len(transcription), part_size)]
+    print(f"[latex] long transcript — splitting into {len(parts)} parts of ~{part_size} chars each")
 
-    # Part 1 — full document + subject
-    print("[latex] starting part-1 conversion...")
-    try:
-        content1 = _llama_call(client, [
-            {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Transcription (part 1 of 2):\n\n{part1}"},
-        ])
-    except Exception as e:
-        print(f"[latex] error on part-1: {e}")
-        raise
-    subject, latex1 = _parse_latex_response(content1)
-    print(f"[latex] part-1 done, length={len(latex1)}")
+    subject = ""
+    full_doc = None
+    merged_body_parts = []
 
-    # Part 2 — body content only (no preamble needed)
-    part2_prompt = (
-        "Continue converting the following Arabic transcription (part 2 of 2) into "
-        "XeLaTeX sections. Return ONLY the LaTeX body content — no preamble, no "
-        "\\begin{document}, no \\end{document}. Just \\section/\\subsection/\\begin{itemize} etc."
-    )
-    print("[latex] starting part-2 conversion...")
-    try:
-        latex2_body = _llama_call(client, [
-            {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-            {"role": "user", "content": f"{part2_prompt}\n\n{part2}"},
-        ])
-    except Exception as e:
-        print(f"[latex] error on part-2: {e}")
-        raise
-    print(f"[latex] part-2 done, length={len(latex2_body)}")
+    for idx, part in enumerate(parts):
+        is_first = (idx == 0)
+        if is_first:
+            prompt_content = f"Transcription (part {idx + 1} of {len(parts)}):\n\n{part}"
+        else:
+            prompt_content = (
+                "Continue converting the following Arabic transcription "
+                f"(part {idx + 1} of {len(parts)}) into XeLaTeX sections. Return ONLY "
+                "the LaTeX body content — no preamble, no \\begin{document}, no "
+                "\\end{document}. Just \\section/\\subsection/\\begin{itemize} etc.\n\n"
+                f"{part}"
+            )
 
-    # Merge: inject part-2 body before \end{document} in the part-1 document
-    body1 = _extract_body(latex1)
+        print(f"[latex] starting part-{idx + 1}/{len(parts)} conversion...")
+        try:
+            content = _llama_call(client, [
+                {"role": "system", "content": LATEX_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_content},
+            ])
+        except Exception as e:
+            print(f"[latex] error on part-{idx + 1}: {e}")
+            raise
+
+        if is_first:
+            subject, full_doc = _parse_latex_response(content)
+            print(f"[latex] part-1 done, length={len(full_doc)}")
+        else:
+            merged_body_parts.append(content.strip())
+            print(f"[latex] part-{idx + 1} done, length={len(content)}")
+
+        # Respect Groq's tokens-per-minute rate limit between calls
+        if idx < len(parts) - 1:
+            time.sleep(10)
+
     end_tag = r"\end{document}"
-    if end_tag in latex1:
-        merged = latex1.replace(end_tag, f"\n{latex2_body.strip()}\n{end_tag}", 1)
+    extra_body = "\n".join(merged_body_parts)
+    if end_tag in full_doc:
+        merged = full_doc.replace(end_tag, f"\n{extra_body}\n{end_tag}", 1)
     else:
-        merged = latex1 + "\n" + latex2_body.strip()
+        merged = full_doc + "\n" + extra_body
 
     print(f"[latex] merge done, total length={len(merged)}")
     return {"subject": subject, "latex": merged}
