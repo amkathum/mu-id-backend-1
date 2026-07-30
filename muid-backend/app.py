@@ -97,6 +97,20 @@ _cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
 _cleanup_thread.start()
 
 # ---------------------------------------------------------------------------
+# Startup checks
+# ---------------------------------------------------------------------------
+def _check_dependencies() -> None:
+    """Log ffmpeg availability at startup so missing binaries are caught early."""
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+        first_line = r.stdout.splitlines()[0] if r.stdout else "(no output)"
+        print(f"[startup] ffmpeg found: {first_line}")
+    except FileNotFoundError:
+        print("[startup] WARNING: ffmpeg not found — compression step will fail")
+
+_check_dependencies()
+
+# ---------------------------------------------------------------------------
 # Audio / transcription helpers
 # ---------------------------------------------------------------------------
 
@@ -110,7 +124,7 @@ def make_tmp() -> Path:
 
 def compress_audio(src: Path, dst: Path) -> None:
     """Downsample to 16 kHz mono 32 kbps MP3 for smaller Groq payloads."""
-    subprocess.run(
+    result = subprocess.run(
         [
             "ffmpeg", "-i", str(src),
             "-ar", "16000",
@@ -119,9 +133,12 @@ def compress_audio(src: Path, dst: Path) -> None:
             str(dst),
             "-y",
         ],
-        check=True,
         capture_output=True,
+        text=True,
     )
+    if result.returncode != 0:
+        print(f"[ffmpeg] stderr:\n{result.stderr}")
+        raise RuntimeError(f"ffmpeg exited with status {result.returncode}:\n{result.stderr}")
 
 
 def chunk_audio(audio_path: Path, tmp_dir: Path) -> list[Path]:
