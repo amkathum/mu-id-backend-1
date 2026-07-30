@@ -1,0 +1,58 @@
+
+
+
+Implement a background job system for long video processing (up to 6 hours) to avoid HTTP timeout errors.
+
+**CHANGES NEEDED:**
+
+**1. New endpoint: POST /api/transcribe-async**
+- Accept the same input as /api/transcribe (youtube_url or file upload)
+- Generate a unique job_id using uuid.uuid4().hex
+- Store job status in memory using a dict: `jobs = {}`
+- Immediately return: `{"job_id": "...", "status": "processing"}`
+- Start the actual processing (download, compress, chunk, transcribe, latex) in a background thread using Python's `threading.Thread`
+
+**2. New endpoint: GET /api/status/<job_id>**
+- Check the jobs dict for that job_id
+- Return one of these states:
+```python
+{"status": "processing", "progress": "compressing audio"}
+{"status": "processing", "progress": "transcribing chunk 5/20"}
+{"status": "completed", "transcript": "...", "latex": "...", "subject": "..."}
+{"status": "failed", "error": "error message here"}
+```
+
+**3. Job storage structure:**
+```python
+jobs = {}
+jobs[job_id] = {
+    "status": "processing",
+    "progress": "",
+    "result": None,
+    "error": None,
+    "created_at": time.time()
+}
+```
+
+**4. Update the existing process_audio function:**
+- Add a `job_id` parameter
+- After each pipeline step (compress, chunk, transcribe, latex), update:
+```python
+jobs[job_id]["progress"] = "step description here"
+```
+- On success: `jobs[job_id]["status"] = "completed"` and store result
+- On failure: `jobs[job_id]["status"] = "failed"` and store error
+
+**5. Cleanup old jobs:**
+- Add a simple cleanup that removes jobs older than 2 hours from the jobs dict to avoid memory leaks
+- Run this check at the start of each new job creation
+
+**6. CORS:**
+- Make sure /api/status/<job_id> also has CORS enabled
+
+**7. Keep the old /api/transcribe and /api/upload endpoints working as-is for short files (under 5 minutes) — don't remove them.**
+
+**Test that:**
+- POST /api/transcribe-async returns a job_id immediately (under 1 second)
+- GET /api/status/<job_id> shows progress updates as processing continues
+- Long files (1+ hour) complete successfully without HTTP timeout
