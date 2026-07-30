@@ -153,26 +153,20 @@ def transcribe_chunks(chunks: list[Path], client: Groq, job_id: str | None = Non
     return "\n".join(parts)
 
 
-def to_latex(transcription: str, client: Groq) -> dict:
-    """Convert transcription text to LaTeX via Groq LLaMA."""
-    text = transcription[:MAX_LATEX_CHARS] if len(transcription) > MAX_LATEX_CHARS else transcription
+def _llama_call(client: Groq, messages: list[dict]) -> str:
+    """Single LLaMA call with a hard 120-second timeout."""
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+        temperature=0.3,
+        max_tokens=8192,
+        timeout=120,
+    )
+    return response.choices[0].message.content or ""
 
-    print("[latex] starting conversion...")
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Transcription:\n\n{text}"},
-            ],
-            temperature=0.3,
-            max_tokens=8192,
-        )
-    except Exception as e:
-        print(f"[latex] error: {e}")
-        raise
 
-    content = response.choices[0].message.content or ""
+def _parse_latex_response(content: str) -> tuple[str, str]:
+    """Extract subject and latex body from a LLaMA response."""
     subject = ""
     latex = ""
     if "SUBJECT:" in content and "LATEX:" in content:
@@ -181,9 +175,87 @@ def to_latex(transcription: str, client: Groq) -> dict:
         latex = latex_part.strip()
     else:
         latex = content
+    return subject, latex
 
-    print(f"[latex] done, length={len(latex)}")
-    return {"subject": subject, "latex": latex}
+
+def _extract_body(latex_doc: str) -> str:
+    """Pull the content between \\begin{document} and \\end{document}."""
+    begin = latex_doc.find(r"\begin{document}")
+    end = latex_doc.find(r"\end{document}")
+    if begin != -1 and end != -1:
+        return latex_doc[begin + len(r"\begin{document}"): end].strip()
+    return latex_doc.strip()
+
+
+def to_latex(transcription: str, client: Groq) -> dict:
+    """Convert transcription to LaTeX.
+
+    If the transcript exceeds MAX_LATEX_CHARS it is split into two halves,
+    each converted separately, then merged into one document.
+    """
+    print(f"[latex] transcript length={len(transcription)}, MAX_LATEX_CHARS={MAX_LATEX_CHARS}")
+
+    if len(transcription) <= MAX_LATEX_CHARS:
+        # ── Single-pass (short transcript) ──────────────────────────────────
+        print("[latex] starting single-pass conversion...")
+        try:
+            content = _llama_call(client, [
+                {"role": "system", "content": LATEX_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Transcription:\n\n{transcription}"},
+            ])
+        except Exception as e:
+            print(f"[latex] error on single-pass: {e}")
+            raise
+        subject, latex = _parse_latex_response(content)
+        print(f"[latex] done (single-pass), length={len(latex)}")
+        return {"subject": subject, "latex": latex}
+
+    # ── Two-pass (long transcript) ───────────────────────────────────────────
+    mid = len(transcription) // 2
+    part1 = transcription[:mid]
+    part2 = transcription[mid:]
+    print(f"[latex] long transcript — splitting into 2 parts ({len(part1)}, {len(part2)} chars)")
+
+    # Part 1 — full document + subject
+    print("[latex] starting part-1 conversion...")
+    try:
+        content1 = _llama_call(client, [
+            {"role": "system", "content": LATEX_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Transcription (part 1 of 2):\n\n{part1}"},
+        ])
+    except Exception as e:
+        print(f"[latex] error on part-1: {e}")
+        raise
+    subject, latex1 = _parse_latex_response(content1)
+    print(f"[latex] part-1 done, length={len(latex1)}")
+
+    # Part 2 — body content only (no preamble needed)
+    part2_prompt = (
+        "Continue converting the following Arabic transcription (part 2 of 2) into "
+        "XeLaTeX sections. Return ONLY the LaTeX body content — no preamble, no "
+        "\\begin{document}, no \\end{document}. Just \\section/\\subsection/\\begin{itemize} etc."
+    )
+    print("[latex] starting part-2 conversion...")
+    try:
+        latex2_body = _llama_call(client, [
+            {"role": "system", "content": LATEX_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{part2_prompt}\n\n{part2}"},
+        ])
+    except Exception as e:
+        print(f"[latex] error on part-2: {e}")
+        raise
+    print(f"[latex] part-2 done, length={len(latex2_body)}")
+
+    # Merge: inject part-2 body before \end{document} in the part-1 document
+    body1 = _extract_body(latex1)
+    end_tag = r"\end{document}"
+    if end_tag in latex1:
+        merged = latex1.replace(end_tag, f"\n{latex2_body.strip()}\n{end_tag}", 1)
+    else:
+        merged = latex1 + "\n" + latex2_body.strip()
+
+    print(f"[latex] merge done, total length={len(merged)}")
+    return {"subject": subject, "latex": merged}
 
 
 def get_video_duration(url: str) -> float:
@@ -245,12 +317,38 @@ def process_audio(audio_path: Path, tmp_dir: Path, job_id: str | None = None) ->
 
     client = Groq(api_key=GROQ_API_KEY)
 
-    compressed = tmp_dir / "compressed.mp3"
-    compress_audio(audio_path, compressed)
+    print(f"[pipeline] step 1/4 — compressing audio: {audio_path.name}")
+    try:
+        compressed = tmp_dir / "compressed.mp3"
+        compress_audio(audio_path, compressed)
+        print(f"[pipeline] step 1/4 — done, size={compressed.stat().st_size} bytes")
+    except Exception as e:
+        print(f"[pipeline] step 1/4 — compress failed: {e}")
+        raise
 
-    chunks = chunk_audio(compressed, tmp_dir)
-    transcription = transcribe_chunks(chunks, client, job_id=job_id)
-    latex_result = to_latex(transcription, client)
+    print("[pipeline] step 2/4 — chunking audio")
+    try:
+        chunks = chunk_audio(compressed, tmp_dir)
+        print(f"[pipeline] step 2/4 — done, {len(chunks)} chunk(s)")
+    except Exception as e:
+        print(f"[pipeline] step 2/4 — chunking failed: {e}")
+        raise
+
+    print(f"[pipeline] step 3/4 — transcribing {len(chunks)} chunk(s)")
+    try:
+        transcription = transcribe_chunks(chunks, client, job_id=job_id)
+        print(f"[pipeline] step 3/4 — done, transcript length={len(transcription)}")
+    except Exception as e:
+        print(f"[pipeline] step 3/4 — transcription failed: {e}")
+        raise
+
+    print("[pipeline] step 4/4 — converting to LaTeX")
+    try:
+        latex_result = to_latex(transcription, client)
+        print("[pipeline] step 4/4 — done")
+    except Exception as e:
+        print(f"[pipeline] step 4/4 — LaTeX conversion failed: {e}")
+        raise
 
     return {
         "transcript": transcription,
