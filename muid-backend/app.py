@@ -21,7 +21,7 @@ CORS(app, origins="*")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_CHUNK_MS = 8 * 60 * 1000   # 8 minutes in milliseconds
 MAX_LATEX_CHARS = 8000           # max chars sent to LLaMA per call
-JOB_TTL = 3600                   # seconds before a completed job is purged (1 hour)
+JOB_TTL = 7200                   # seconds before a completed job is purged (2 hours)
 
 LATEX_SYSTEM_PROMPT = """\
 You are an expert Arabic academic typesetter.
@@ -53,11 +53,19 @@ jobs_lock = threading.Lock()
 
 
 def _new_job() -> str:
-    """Create a new job entry and return its ID."""
+    """Create a new job entry and return its ID. Also purges expired jobs inline."""
     job_id = uuid.uuid4().hex
+    cutoff = time.time() - JOB_TTL
     with jobs_lock:
+        # Inline cleanup: remove jobs older than JOB_TTL
+        expired = [jid for jid, j in jobs.items() if j["created_at"] < cutoff]
+        for jid in expired:
+            del jobs[jid]
         jobs[job_id] = {
             "status": "processing",
+            "progress": "",
+            "result": None,
+            "error": None,
             "created_at": time.time(),
         }
     return job_id
@@ -65,12 +73,12 @@ def _new_job() -> str:
 
 def _finish_job(job_id: str, result: dict) -> None:
     with jobs_lock:
-        jobs[job_id].update({"status": "done", **result})
+        jobs[job_id].update({"status": "completed", "result": result})
 
 
 def _fail_job(job_id: str, message: str) -> None:
     with jobs_lock:
-        jobs[job_id].update({"status": "error", "message": message})
+        jobs[job_id].update({"status": "failed", "error": message})
 
 
 def _cleanup_loop() -> None:
@@ -148,7 +156,7 @@ def transcribe_chunks(chunks: list[Path], client: Groq, job_id: str | None = Non
         if job_id:
             with jobs_lock:
                 if job_id in jobs:
-                    jobs[job_id]["progress"] = f"جاري تفريغ الجزء {i + 1} من {total}"
+                    jobs[job_id]["progress"] = f"transcribing chunk {i + 1}/{total}"
         parts.append(transcribe_file(chunk, client))
     return "\n".join(parts)
 
@@ -317,7 +325,14 @@ def process_audio(audio_path: Path, tmp_dir: Path, job_id: str | None = None) ->
 
     client = Groq(api_key=GROQ_API_KEY)
 
+    def _set_progress(msg: str) -> None:
+        if job_id:
+            with jobs_lock:
+                if job_id in jobs:
+                    jobs[job_id]["progress"] = msg
+
     print(f"[pipeline] step 1/4 — compressing audio: {audio_path.name}")
+    _set_progress("compressing audio")
     try:
         compressed = tmp_dir / "compressed.mp3"
         compress_audio(audio_path, compressed)
@@ -327,6 +342,7 @@ def process_audio(audio_path: Path, tmp_dir: Path, job_id: str | None = None) ->
         raise
 
     print("[pipeline] step 2/4 — chunking audio")
+    _set_progress("splitting audio into chunks")
     try:
         chunks = chunk_audio(compressed, tmp_dir)
         print(f"[pipeline] step 2/4 — done, {len(chunks)} chunk(s)")
@@ -335,6 +351,7 @@ def process_audio(audio_path: Path, tmp_dir: Path, job_id: str | None = None) ->
         raise
 
     print(f"[pipeline] step 3/4 — transcribing {len(chunks)} chunk(s)")
+    _set_progress(f"transcribing chunk 1/{len(chunks)}")
     try:
         transcription = transcribe_chunks(chunks, client, job_id=job_id)
         print(f"[pipeline] step 3/4 — done, transcript length={len(transcription)}")
@@ -343,6 +360,7 @@ def process_audio(audio_path: Path, tmp_dir: Path, job_id: str | None = None) ->
         raise
 
     print("[pipeline] step 4/4 — converting to LaTeX")
+    _set_progress("converting to LaTeX")
     try:
         latex_result = to_latex(transcription, client)
         print("[pipeline] step 4/4 — done")
@@ -362,12 +380,13 @@ def process_audio(audio_path: Path, tmp_dir: Path, job_id: str | None = None) ->
 # ---------------------------------------------------------------------------
 
 
-def _run_youtube_job(job_id: str, youtube_url: str) -> None:
+def _run_youtube_job(job_id: str, youtube_url: str, max_duration: int = 7200) -> None:
     tmp_dir = make_tmp()
     try:
         duration = get_video_duration(youtube_url)
-        if duration > 7200:
-            _fail_job(job_id, "الفيديو طويل جداً، الحد الأقصى ساعتان حالياً")
+        if duration > max_duration:
+            hours = max_duration // 3600
+            _fail_job(job_id, f"الفيديو طويل جداً، الحد الأقصى {hours} ساعات حالياً")
             return
         audio_path = download_youtube_audio(youtube_url, tmp_dir)
         result = process_audio(audio_path, tmp_dir, job_id=job_id)
@@ -418,6 +437,26 @@ def transcribe_youtube():
     return jsonify({"job_id": job_id, "status": "processing"}), 202
 
 
+@app.route("/api/transcribe-async", methods=["POST"])
+def transcribe_youtube_async():
+    """Long-video async transcription — supports up to 6 hours. Returns job_id immediately."""
+    data = request.get_json(silent=True) or {}
+    youtube_url = data.get("youtube_url", "").strip()
+
+    if not youtube_url:
+        return jsonify({"error": "youtube_url is required"}), 400
+
+    job_id = _new_job()
+    thread = threading.Thread(
+        target=_run_youtube_job,
+        args=(job_id, youtube_url, 21600),  # 6-hour limit
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"job_id": job_id, "status": "processing"}), 202
+
+
 @app.route("/api/upload", methods=["POST"])
 def upload_audio():
     """Kick off a background upload transcription job; return job_id immediately."""
@@ -461,16 +500,17 @@ def job_status(job_id: str):
             "progress": job.get("progress", ""),
         })
 
-    if status == "done":
+    if status == "completed":
+        result = job.get("result") or {}
         return jsonify({
-            "status": "done",
-            "transcript": job.get("transcript", ""),
-            "subject": job.get("subject", ""),
-            "latex": job.get("latex", ""),
+            "status": "completed",
+            "transcript": result.get("transcript", ""),
+            "subject": result.get("subject", ""),
+            "latex": result.get("latex", ""),
         })
 
-    # status == "error"
-    return jsonify({"status": "error", "message": job.get("message", "Unknown error")})
+    # status == "failed"
+    return jsonify({"status": "failed", "error": job.get("error", "Unknown error")})
 
 
 # ---------------------------------------------------------------------------
