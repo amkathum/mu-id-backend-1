@@ -1,19 +1,19 @@
-    import os
-    import uuid
-    import shutil
-    import subprocess
-    import threading
-    import time
-    import math
-    import random
-    import requests
-    from pathlib import Path
+import os
+import uuid
+import shutil
+import subprocess
+import threading
+import time
+import math
+import random
+import requests
+from pathlib import Path
 
-    from flask import Flask, request, jsonify
-    from flask_cors import CORS
-    from groq import Groq
-    import yt_dlp
-    from pydub import AudioSegment
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from groq import Groq
+import yt_dlp
+from pydub import AudioSegment
 
     app = Flask(__name__)
     CORS(app, origins="*")
