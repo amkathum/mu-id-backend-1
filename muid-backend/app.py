@@ -439,12 +439,40 @@ def transcribe_youtube():
 
 @app.route("/api/transcribe-async", methods=["POST"])
 def transcribe_youtube_async():
-    """Long-video async transcription — supports up to 6 hours. Returns job_id immediately."""
+    """Long-video async transcription — supports up to 6 hours. Returns job_id immediately.
+
+    Accepts either:
+    - JSON body:              {"youtube_url": "..."}
+    - multipart/form-data:   file field named 'file'
+    """
+    # ── File upload path ────────────────────────────────────────────────────
+    if request.content_type and "multipart/form-data" in request.content_type:
+        if "file" not in request.files:
+            return jsonify({"error": "No file part in request"}), 400
+        uploaded = request.files["file"]
+        if not uploaded.filename:
+            return jsonify({"error": "Empty filename"}), 400
+
+        tmp_dir = make_tmp()
+        suffix = Path(uploaded.filename).suffix or ".mp3"
+        audio_path = tmp_dir / f"upload{suffix}"
+        uploaded.save(str(audio_path))
+
+        job_id = _new_job()
+        thread = threading.Thread(
+            target=_run_upload_job,
+            args=(job_id, audio_path, tmp_dir),
+            daemon=True,
+        )
+        thread.start()
+        return jsonify({"job_id": job_id, "status": "processing"}), 202
+
+    # ── YouTube URL path ────────────────────────────────────────────────────
     data = request.get_json(silent=True) or {}
     youtube_url = data.get("youtube_url", "").strip()
 
     if not youtube_url:
-        return jsonify({"error": "youtube_url is required"}), 400
+        return jsonify({"error": "Provide either a youtube_url (JSON) or a file (multipart)"}), 400
 
     job_id = _new_job()
     thread = threading.Thread(
@@ -453,7 +481,6 @@ def transcribe_youtube_async():
         daemon=True,
     )
     thread.start()
-
     return jsonify({"job_id": job_id, "status": "processing"}), 202
 
 
