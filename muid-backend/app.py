@@ -140,9 +140,17 @@ def transcribe_file(audio_path: Path, client: Groq) -> str:
     return result if isinstance(result, str) else result.text
 
 
-def transcribe_chunks(chunks: list[Path], client: Groq) -> str:
-    """Transcribe each chunk and join results."""
-    return "\n".join(transcribe_file(c, client) for c in chunks)
+def transcribe_chunks(chunks: list[Path], client: Groq, job_id: str | None = None) -> str:
+    """Transcribe each chunk and join results, updating job progress after each one."""
+    total = len(chunks)
+    parts = []
+    for i, chunk in enumerate(chunks):
+        if job_id:
+            with jobs_lock:
+                if job_id in jobs:
+                    jobs[job_id]["progress"] = f"جاري تفريغ الجزء {i + 1} من {total}"
+        parts.append(transcribe_file(chunk, client))
+    return "\n".join(parts)
 
 
 def to_latex(transcription: str, client: Groq) -> dict:
@@ -178,6 +186,25 @@ def to_latex(transcription: str, client: Groq) -> dict:
     return {"subject": subject, "latex": latex}
 
 
+def get_video_duration(url: str) -> float:
+    """Return video duration in seconds without downloading the file."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return float(info.get("duration") or 0)
+
+
 def download_youtube_audio(url: str, tmp_dir: Path) -> Path:
     """Download best-audio from a YouTube URL, extract to MP3."""
     ydl_opts = {
@@ -211,7 +238,7 @@ def download_youtube_audio(url: str, tmp_dir: Path) -> Path:
     return mp3_files[0]
 
 
-def process_audio(audio_path: Path, tmp_dir: Path) -> dict:
+def process_audio(audio_path: Path, tmp_dir: Path, job_id: str | None = None) -> dict:
     """Core pipeline: compress → chunk → transcribe → latex."""
     if not GROQ_API_KEY:
         raise EnvironmentError("GROQ_API_KEY is not set.")
@@ -222,7 +249,7 @@ def process_audio(audio_path: Path, tmp_dir: Path) -> dict:
     compress_audio(audio_path, compressed)
 
     chunks = chunk_audio(compressed, tmp_dir)
-    transcription = transcribe_chunks(chunks, client)
+    transcription = transcribe_chunks(chunks, client, job_id=job_id)
     latex_result = to_latex(transcription, client)
 
     return {
@@ -240,8 +267,12 @@ def process_audio(audio_path: Path, tmp_dir: Path) -> dict:
 def _run_youtube_job(job_id: str, youtube_url: str) -> None:
     tmp_dir = make_tmp()
     try:
+        duration = get_video_duration(youtube_url)
+        if duration > 7200:
+            _fail_job(job_id, "الفيديو طويل جداً، الحد الأقصى ساعتان حالياً")
+            return
         audio_path = download_youtube_audio(youtube_url, tmp_dir)
-        result = process_audio(audio_path, tmp_dir)
+        result = process_audio(audio_path, tmp_dir, job_id=job_id)
         _finish_job(job_id, result)
     except Exception as exc:
         _fail_job(job_id, str(exc))
@@ -251,7 +282,7 @@ def _run_youtube_job(job_id: str, youtube_url: str) -> None:
 
 def _run_upload_job(job_id: str, audio_path: Path, tmp_dir: Path) -> None:
     try:
-        result = process_audio(audio_path, tmp_dir)
+        result = process_audio(audio_path, tmp_dir, job_id=job_id)
         _finish_job(job_id, result)
     except Exception as exc:
         _fail_job(job_id, str(exc))
@@ -327,7 +358,10 @@ def job_status(job_id: str):
     status = job["status"]
 
     if status == "processing":
-        return jsonify({"status": "processing"})
+        return jsonify({
+            "status": "processing",
+            "progress": job.get("progress", ""),
+        })
 
     if status == "done":
         return jsonify({
