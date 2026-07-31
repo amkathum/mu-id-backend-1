@@ -20,7 +20,7 @@ CORS(app, origins="*")
 # ---------------------------------------------------------------------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_CHUNK_MS = 8 * 60 * 1000   # 8 minutes in milliseconds
-MAX_LATEX_CHARS = 5           # max chars sent to LLaMA per call
+MAX_LATEX_CHARS = 5000           # max chars sent to LLaMA per call
 JOB_TTL = 7200                   # seconds before a completed job is purged (2 hours)
 
 LATEX_SYSTEM_PROMPT = """\
