@@ -20,7 +20,7 @@ CORS(app, origins="*")
 # ---------------------------------------------------------------------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_CHUNK_MS = 8 * 60 * 1000   # 8 minutes in milliseconds
-MAX_LATEX_CHARS = 5000           # max chars sent to LLaMA per call
+MAX_LATEX_CHARS = 2500           # max chars sent to LLaMA per call
 JOB_TTL = 7200                   # seconds before a completed job is purged (2 hours)
 
 LATEX_SYSTEM_PROMPT = """\
@@ -184,7 +184,7 @@ def _llama_call(client: Groq, messages: list[dict]) -> str:
         model="llama-3.3-70b-versatile",
         messages=messages,
         temperature=0.3,
-        max_tokens=8192,
+        max_tokens=4000,
         timeout=120,
     )
     return response.choices[0].message.content or ""
