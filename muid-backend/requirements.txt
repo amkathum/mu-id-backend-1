@@ -5,3 +5,4 @@ groq==0.13.1
 yt-dlp==2025.1.15
 pydub==0.25.1
 gevent==24.11.1
+requests
