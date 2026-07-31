@@ -292,8 +292,7 @@ def get_video_duration(url: str) -> float:
         "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios"],
-                "player_skip": ["webpage", "configs"],
+                "player_client": ["android", "web", "tv"],
             }
         },
     }
@@ -315,8 +314,7 @@ def download_youtube_audio(url: str, tmp_dir: Path) -> Path:
         ],
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios"],
-                "player_skip": ["webpage", "configs"],
+                "player_client": ["android", "web", "tv"],
             }
         },
         "nocheckcertificate": True,
