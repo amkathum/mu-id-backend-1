@@ -499,9 +499,13 @@ def transcribe_youtube_async():
     print(f"[transcribe-async] files={list(request.files.keys())}")
     print(f"[transcribe-async] form={dict(request.form)}")
     if request.content_type and "multipart/form-data" in request.content_type:
-        if "file" not in request.files:
-            return jsonify({"error": "No file part in request"}), 400
-        uploaded = request.files["file"]
+        uploaded = None
+        for field in ["file", "audio", "upload", "video"]:
+            if field in request.files:
+                uploaded = request.files[field]
+                break
+        if uploaded is None:
+            return jsonify({"error": "No file found. Use field name: file, audio, upload, or video"}), 400
         if not uploaded.filename:
             return jsonify({"error": "Empty filename"}), 400
 
