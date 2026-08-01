@@ -228,7 +228,6 @@ def _llama_call_with_fallback(client: Groq, messages: list[dict]) -> str:
                 return _openrouter_call(messages, model="openai/gpt-oss-120b:free")
         raise
 
-
 def _parse_latex_response(content: str) -> tuple[str, str]:
     """Extract subject and latex body from a LLaMA response."""
     subject = ""
@@ -238,7 +237,8 @@ def _parse_latex_response(content: str) -> tuple[str, str]:
         subject = subject_part.replace("SUBJECT:", "").strip()
         latex = latex_part.strip()
     else:
-        latex = content
+        print(f"[latex-parse] WARNING: response missing SUBJECT:/LATEX: markers. First 200 chars: {content[:200]}")
+            latex = ""  # empty instead of raw transcript — signals failure clearly
     return subject, latex
 
 
@@ -304,6 +304,16 @@ def to_latex(transcription: str, client: Groq) -> dict:
     except Exception as e:
         print(f"[latex] error on part-2: {e}")
         raise
+    # Retry once if the response doesn't look like LaTeX (missing key markers)
+    if r"\section" not in latex2_body and r"\subsection" not in latex2_body:
+        print(f"[latex] WARNING: part-2 doesn't look like LaTeX, retrying once. First 200 chars: {latex2_body[:200]}")
+        try:
+            latex2_body = _llama_call_with_fallback(client, [
+                {"role": "system", "content": LATEX_SYSTEM_PROMPT},
+                {"role": "user", "content": f"{part2_prompt}\n\n{part2}"},
+            ])
+        except Exception as e:
+            print(f"[latex] retry on part-2 also failed: {e}")
     print(f"[latex] part-2 done, length={len(latex2_body)}")
 
     end_tag = r"\end{document}"
