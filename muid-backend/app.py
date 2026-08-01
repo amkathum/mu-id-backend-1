@@ -494,6 +494,9 @@ def transcribe_youtube_async():
     - JSON body:              {"youtube_url": "..."}
     - multipart/form-data:   file field named 'file'
     """
+    print(f"[transcribe-async] content_type={request.content_type}")
+    print(f"[transcribe-async] files={list(request.files.keys())}")
+    print(f"[transcribe-async] form={dict(request.form)}")
     if request.content_type and "multipart/form-data" in request.content_type:
         if "file" not in request.files:
             return jsonify({"error": "No file part in request"}), 400
