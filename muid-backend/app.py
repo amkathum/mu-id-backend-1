@@ -9,6 +9,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from groq import Groq
+import requests
 import yt_dlp
 from pydub import AudioSegment
 
@@ -19,6 +20,7 @@ CORS(app, origins="*")
 # Configuration
 # ---------------------------------------------------------------------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 MAX_CHUNK_MS = 8 * 60 * 1000   # 8 minutes in milliseconds
 MAX_LATEX_CHARS = 2000           # max chars sent to LLaMA per call
 JOB_TTL = 7200                   # seconds before a completed job is purged (2 hours)
@@ -187,6 +189,41 @@ def _llama_call(client: Groq, messages: list[dict]) -> str:
         max_tokens=4000,
         timeout=120,
     )
+def _openrouter_call(messages: list[dict], model: str = "deepseek/deepseek-v4-flash:free") -> str:
+        """Fallback call to OpenRouter when Groq hits a rate limit."""
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": 4000,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"] or ""
+
+
+def _llama_call_with_fallback(client: Groq, messages: list[dict]) -> str:
+        """Try Groq first; fall back to OpenRouter free models if Groq's rate limit is hit."""
+        try:
+            return _llama_call(client, messages)
+        except Exception as e:
+            error_str = str(e)
+            if "rate_limit" in error_str or "413" in error_str or "429" in error_str:
+                print(f"[fallback] Groq limit hit ({error_str[:100]}), trying OpenRouter...")
+                try:
+                    return _openrouter_call(messages, model="deepseek/deepseek-v4-flash:free")
+                except Exception as e2:
+                    print(f"[fallback] OpenRouter deepseek failed ({str(e2)[:100]}), trying gpt-oss...")
+                    return _openrouter_call(messages, model="openai/gpt-oss-120b:free")
+            raise
     time.sleep(15)  # respect Groq's 12,000 TPM limit
     return response.choices[0].message.content or ""
 
@@ -225,7 +262,7 @@ def to_latex(transcription: str, client: Groq) -> dict:
         # ── Single-pass (short transcript) ──────────────────────────────────
         print("[latex] starting single-pass conversion...")
         try:
-            content = _llama_call(client, [
+            content = _llama_call_with_fallback(client, [
                 {"role": "system", "content": LATEX_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Transcription:\n\n{transcription}"},
             ])
@@ -245,7 +282,7 @@ def to_latex(transcription: str, client: Groq) -> dict:
     # Part 1 — full document + subject
     print("[latex] starting part-1 conversion...")
     try:
-        content1 = _llama_call(client, [
+        content1 = _llama_call_with_fallback(client, [
             {"role": "system", "content": LATEX_SYSTEM_PROMPT},
             {"role": "user", "content": f"Transcription (part 1 of 2):\n\n{part1}"},
         ])
@@ -263,7 +300,7 @@ def to_latex(transcription: str, client: Groq) -> dict:
     )
     print("[latex] starting part-2 conversion...")
     try:
-        latex2_body = _llama_call(client, [
+        latex2_body = _llama_call_with_fallback(client, [
             {"role": "system", "content": LATEX_SYSTEM_PROMPT},
             {"role": "user", "content": f"{part2_prompt}\n\n{part2}"},
         ])
