@@ -15,6 +15,7 @@ from pydub import AudioSegment
 
 app = Flask(__name__)
 CORS(app, origins="*")
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB max upload
 
 # ---------------------------------------------------------------------------
 # Configuration
