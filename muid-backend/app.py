@@ -59,7 +59,6 @@ def _new_job() -> str:
     job_id = uuid.uuid4().hex
     cutoff = time.time() - JOB_TTL
     with jobs_lock:
-        # Inline cleanup: remove jobs older than JOB_TTL
         expired = [jid for jid, j in jobs.items() if j["created_at"] < cutoff]
         for jid in expired:
             del jobs[jid]
@@ -94,7 +93,6 @@ def _cleanup_loop() -> None:
                 del jobs[jid]
 
 
-# Start the cleanup daemon immediately
 _cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
 _cleanup_thread.start()
 
@@ -189,43 +187,45 @@ def _llama_call(client: Groq, messages: list[dict]) -> str:
         max_tokens=4000,
         timeout=120,
     )
+    time.sleep(15)  # respect Groq's 12,000 TPM limit
+    return response.choices[0].message.content or ""
+
+
 def _openrouter_call(messages: list[dict], model: str = "deepseek/deepseek-v4-flash:free") -> str:
-        """Fallback call to OpenRouter when Groq hits a rate limit."""
-        response = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": messages,
-                "temperature": 0.3,
-                "max_tokens": 4000,
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"] or ""
+    """Fallback call to OpenRouter when Groq hits a rate limit."""
+    response = requests.post(
+        url="https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 4000,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"] or ""
 
 
 def _llama_call_with_fallback(client: Groq, messages: list[dict]) -> str:
-        """Try Groq first; fall back to OpenRouter free models if Groq's rate limit is hit."""
-        try:
-            return _llama_call(client, messages)
-        except Exception as e:
-            error_str = str(e)
-            if "rate_limit" in error_str or "413" in error_str or "429" in error_str:
-                print(f"[fallback] Groq limit hit ({error_str[:100]}), trying OpenRouter...")
-                try:
-                    return _openrouter_call(messages, model="deepseek/deepseek-v4-flash:free")
-                except Exception as e2:
-                    print(f"[fallback] OpenRouter deepseek failed ({str(e2)[:100]}), trying gpt-oss...")
-                    return _openrouter_call(messages, model="openai/gpt-oss-120b:free")
-            raise
-    time.sleep(15)  # respect Groq's 12,000 TPM limit
-    return response.choices[0].message.content or ""
+    """Try Groq first; fall back to OpenRouter free models if Groq's rate limit is hit."""
+    try:
+        return _llama_call(client, messages)
+    except Exception as e:
+        error_str = str(e)
+        if "rate_limit" in error_str or "413" in error_str or "429" in error_str:
+            print(f"[fallback] Groq limit hit ({error_str[:100]}), trying OpenRouter...")
+            try:
+                return _openrouter_call(messages, model="deepseek/deepseek-v4-flash:free")
+            except Exception as e2:
+                print(f"[fallback] OpenRouter deepseek failed ({str(e2)[:100]}), trying gpt-oss...")
+                return _openrouter_call(messages, model="openai/gpt-oss-120b:free")
+        raise
 
 
 def _parse_latex_response(content: str) -> tuple[str, str]:
@@ -259,7 +259,6 @@ def to_latex(transcription: str, client: Groq) -> dict:
     print(f"[latex] transcript length={len(transcription)}, MAX_LATEX_CHARS={MAX_LATEX_CHARS}")
 
     if len(transcription) <= MAX_LATEX_CHARS:
-        # ── Single-pass (short transcript) ──────────────────────────────────
         print("[latex] starting single-pass conversion...")
         try:
             content = _llama_call_with_fallback(client, [
@@ -273,13 +272,11 @@ def to_latex(transcription: str, client: Groq) -> dict:
         print(f"[latex] done (single-pass), length={len(latex)}")
         return {"subject": subject, "latex": latex}
 
-    # ── Two-pass (long transcript) ───────────────────────────────────────────
     mid = len(transcription) // 2
     part1 = transcription[:mid]
     part2 = transcription[mid:]
     print(f"[latex] long transcript — splitting into 2 parts ({len(part1)}, {len(part2)} chars)")
 
-    # Part 1 — full document + subject
     print("[latex] starting part-1 conversion...")
     try:
         content1 = _llama_call_with_fallback(client, [
@@ -292,7 +289,6 @@ def to_latex(transcription: str, client: Groq) -> dict:
     subject, latex1 = _parse_latex_response(content1)
     print(f"[latex] part-1 done, length={len(latex1)}")
 
-    # Part 2 — body content only (no preamble needed)
     part2_prompt = (
         "Continue converting the following Arabic transcription (part 2 of 2) into "
         "XeLaTeX sections. Return ONLY the LaTeX body content — no preamble, no "
@@ -309,8 +305,6 @@ def to_latex(transcription: str, client: Groq) -> dict:
         raise
     print(f"[latex] part-2 done, length={len(latex2_body)}")
 
-    # Merge: inject part-2 body before \end{document} in the part-1 document
-    body1 = _extract_body(latex1)
     end_tag = r"\end{document}"
     if end_tag in latex1:
         merged = latex1.replace(end_tag, f"\n{latex2_body.strip()}\n{end_tag}", 1)
@@ -500,7 +494,6 @@ def transcribe_youtube_async():
     - JSON body:              {"youtube_url": "..."}
     - multipart/form-data:   file field named 'file'
     """
-    # ── File upload path ────────────────────────────────────────────────────
     if request.content_type and "multipart/form-data" in request.content_type:
         if "file" not in request.files:
             return jsonify({"error": "No file part in request"}), 400
@@ -522,7 +515,6 @@ def transcribe_youtube_async():
         thread.start()
         return jsonify({"job_id": job_id, "status": "processing"}), 202
 
-    # ── YouTube URL path ────────────────────────────────────────────────────
     data = request.get_json(silent=True) or {}
     youtube_url = data.get("youtube_url", "").strip()
 
@@ -594,7 +586,6 @@ def job_status(job_id: str):
             "latex": result.get("latex", ""),
         })
 
-    # status == "failed"
     return jsonify({"status": "failed", "error": job.get("error", "Unknown error")})
 
 
