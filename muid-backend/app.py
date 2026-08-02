@@ -28,24 +28,39 @@ JOB_TTL = 7200                   # seconds before a completed job is purged (2 h
 
 LATEX_SYSTEM_PROMPT = """\
 You are an expert Arabic academic typesetter.
-Given a transcription of an Arabic lecture or document, convert it into a
-beautiful, well-structured XeLaTeX document.
+Given a transcription of an Arabic lecture or document, convert it into 
+well-structured LaTeX BODY content only.
 
 Return your response in EXACTLY this format (nothing else before or after):
 
 SUBJECT: [English subject of the content]
-LATEX: [complete, compilable XeLaTeX source code]
+LATEX: [LaTeX body content only — sections, subsections, tcolorboxes, itemize]
 
-LaTeX requirements:
-- \\documentclass{article}
-- Use Polyglossia: \\setmainlanguage{arabic}, \\setotherlanguage{english}
-- Use Amiri font: \\setmainfont{Amiri}
-- RTL layout: \\usepackage{geometry} with appropriate margins
-- Use \\usepackage{tcolorbox} for highlighted boxes
-- Organize content with \\section, \\subsection, \\begin{itemize} etc.
-- Include \\usepackage{xcolor} for colours
-- The document must be self-contained and compile with xelatex
-- Do NOT truncate the output; include every detail from the transcription
+CRITICAL RULES:
+- Do NOT include \\documentclass, \\usepackage, \\begin{document}, or \\end{document}
+- Only output the BODY: \\section, \\subsection, \\begin{itemize}, \\begin{tcolorbox}, etc.
+- Cover EVERY topic and detail from the transcription — do not summarize or skip content
+- Each distinct topic must have its own unique \\section or \\subsection — 
+  NEVER repeat the same heading title twice
+- Use \\begin{tcolorbox} for definitions and key explanations
+- Use \\begin{itemize} for lists of related points
+"""
+
+LATEX_PREAMBLE = r"""\documentclass{article}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{polyglossia}
+\setmainlanguage{arabic}
+\setotherlanguage{english}
+\usepackage{fontspec}
+\setmainfont{Amiri}
+\usepackage{tcolorbox}
+\usepackage{xcolor}
+\begin{document}
+"""
+
+LATEX_POSTAMBLE = r"""
+\end{document}
 """
 
 # ---------------------------------------------------------------------------
@@ -269,9 +284,10 @@ def to_latex(transcription: str, client: Groq) -> dict:
         except Exception as e:
             print(f"[latex] error on single-pass: {e}")
             raise
-        subject, latex = _parse_latex_response(content)
-        print(f"[latex] done (single-pass), length={len(latex)}")
-        return {"subject": subject, "latex": latex}
+        subject, latex_body = _parse_latex_response(content)
+        full_latex = LATEX_PREAMBLE + latex_body + LATEX_POSTAMBLE
+        print(f"[latex] done (single-pass), length={len(full_latex)}")
+        return {"subject": subject, "latex": full_latex}
 
     mid = len(transcription) // 2
     part1 = transcription[:mid]
@@ -322,8 +338,9 @@ def to_latex(transcription: str, client: Groq) -> dict:
     else:
         merged = latex1 + "\n" + latex2_body.strip()
 
-    print(f"[latex] merge done, total length={len(merged)}")
-    return {"subject": subject, "latex": merged}
+    full_latex = LATEX_PREAMBLE + merged + LATEX_POSTAMBLE
+    print(f"[latex] merge done, total length={len(full_latex)}")
+    return {"subject": subject, "latex": full_latex}
 
 
 def get_video_duration(url: str) -> float:
