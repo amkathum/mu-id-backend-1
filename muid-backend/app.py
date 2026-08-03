@@ -253,142 +253,81 @@ def _parse_latex_response(content: str) -> tuple[str, str]:
         latex = latex_part.strip()
     else:
         print(f"[latex-parse] WARNING: response missing SUBJECT:/LATEX: markers. First 200 chars: {content[:200]}")
-            latex = ""  # empty instead of raw transcript — signals failure clearly
+        latex = ""
     return subject, latex
 
 
-def _extract_body(latex_doc: str) -> str:
-    """Pull the content between \\begin{document} and \\end{document}."""
-    begin = latex_doc.find(r"\begin{document}")
-    end = latex_doc.find(r"\end{document}")
-    if begin != -1 and end != -1:
-        return latex_doc[begin + len(r"\begin{document}"): end].strip()
-    return latex_doc.strip()
+def to_latex(transcription: str, client: Groq) -> dict:
+    """Convert transcription to LaTeX.
 
+    Splits the transcript into small chunks (each under MAX_LATEX_CHARS)
+    so LLaMA can cover every detail without being forced to summarize.
+    """
+    print(f"[latex] transcript length={len(transcription)}, MAX_LATEX_CHARS={MAX_LATEX_CHARS}")
 
-    def to_latex(transcription: str, client: Groq) -> dict:
-        """Convert transcription to LaTeX.
+    parts = []
+    remaining = transcription
+    while remaining:
+        if len(remaining) <= MAX_LATEX_CHARS:
+            parts.append(remaining)
+            break
+        cut = remaining.rfind(".", 0, MAX_LATEX_CHARS)
+        if cut == -1 or cut < MAX_LATEX_CHARS // 2:
+            cut = MAX_LATEX_CHARS
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:]
 
-        Splits the transcript into small chunks (each under MAX_LATEX_CHARS)
-        so LLaMA can cover every detail without being forced to summarize.
-        """
-        print(f"[latex] transcript length={len(transcription)}, MAX_LATEX_CHARS={MAX_LATEX_CHARS}")
+    print(f"[latex] split into {len(parts)} part(s) for full-detail conversion")
 
-        parts = []
-        remaining = transcription
-        while remaining:
-            if len(remaining) <= MAX_LATEX_CHARS:
-                parts.append(remaining)
-                break
-            cut = remaining.rfind(".", 0, MAX_LATEX_CHARS)
-            if cut == -1 or cut < MAX_LATEX_CHARS // 2:
-                cut = MAX_LATEX_CHARS
-            parts.append(remaining[:cut])
-            remaining = remaining[cut:]
+    subject = ""
+    body_sections = []
 
-        print(f"[latex] split into {len(parts)} part(s) for full-detail conversion")
+    for i, part in enumerate(parts):
+        is_first = (i == 0)
+        part_label = f"part {i + 1} of {len(parts)}"
+        print(f"[latex] starting {part_label} conversion...")
 
-        subject = ""
-        body_sections = []
+        if is_first:
+            user_content = f"Transcription ({part_label}):\n\n{part}"
+        else:
+            user_content = (
+                f"Continue converting the following Arabic transcription ({part_label}) "
+                f"into LaTeX body content. Return ONLY the LaTeX body — no SUBJECT line needed "
+                f"since it was already provided in part 1.\n\n{part}"
+            )
 
-        for i, part in enumerate(parts):
-            is_first = (i == 0)
-            part_label = f"part {i + 1} of {len(parts)}"
-            print(f"[latex] starting {part_label} conversion...")
+        try:
+            content = _llama_call_with_fallback(client, [
+                {"role": "system", "content": LATEX_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ])
+        except Exception as e:
+            print(f"[latex] error on {part_label}: {e}")
+            raise
 
-            if is_first:
-                user_content = f"Transcription ({part_label}):\n\n{part}"
-            else:
-                user_content = (
-                    f"Continue converting the following Arabic transcription ({part_label}) "
-                    f"into LaTeX body content. Return ONLY the LaTeX body — no SUBJECT line needed "
-                    f"since it was already provided in part 1.\n\n{part}"
-                )
+        part_subject, part_body = _parse_latex_response(content)
 
+        if r"\section" not in part_body and r"\subsection" not in part_body:
+            print(f"[latex] WARNING: {part_label} doesn't look like LaTeX, retrying once. First 200 chars: {part_body[:200]}")
             try:
                 content = _llama_call_with_fallback(client, [
                     {"role": "system", "content": LATEX_SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ])
+                part_subject, part_body = _parse_latex_response(content)
             except Exception as e:
-                print(f"[latex] error on {part_label}: {e}")
-                raise
+                print(f"[latex] retry on {part_label} also failed: {e}")
 
-            part_subject, part_body = _parse_latex_response(content)
+        if is_first and part_subject:
+            subject = part_subject
 
-            if r"\section" not in part_body and r"\subsection" not in part_body:
-                print(f"[latex] WARNING: {part_label} doesn't look like LaTeX, retrying once. First 200 chars: {part_body[:200]}")
-                try:
-                    content = _llama_call_with_fallback(client, [
-                        {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_content},
-                    ])
-                    part_subject, part_body = _parse_latex_response(content)
-                except Exception as e:
-                    print(f"[latex] retry on {part_label} also failed: {e}")
+        body_sections.append(part_body)
+        print(f"[latex] {part_label} done, length={len(part_body)}")
 
-            if is_first and part_subject:
-                subject = part_subject
-
-            body_sections.append(part_body)
-            print(f"[latex] {part_label} done, length={len(part_body)}")
-
-        full_body = "\n\n".join(body_sections)
-        full_latex = LATEX_PREAMBLE + full_body + LATEX_POSTAMBLE
-        print(f"[latex] all parts merged, total length={len(full_latex)}")
-        return {"subject": subject, "latex": full_latex}
-    mid = len(transcription) // 2
-    part1 = transcription[:mid]
-    part2 = transcription[mid:]
-    print(f"[latex] long transcript — splitting into 2 parts ({len(part1)}, {len(part2)} chars)")
-
-    print("[latex] starting part-1 conversion...")
-    try:
-        content1 = _llama_call_with_fallback(client, [
-            {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Transcription (part 1 of 2):\n\n{part1}"},
-        ])
-    except Exception as e:
-        print(f"[latex] error on part-1: {e}")
-        raise
-    subject, latex1 = _parse_latex_response(content1)
-    print(f"[latex] part-1 done, length={len(latex1)}")
-
-    part2_prompt = (
-        "Continue converting the following Arabic transcription (part 2 of 2) into "
-        "XeLaTeX sections. Return ONLY the LaTeX body content — no preamble, no "
-        "\\begin{document}, no \\end{document}. Just \\section/\\subsection/\\begin{itemize} etc."
-    )
-    print("[latex] starting part-2 conversion...")
-    try:
-        latex2_body = _llama_call_with_fallback(client, [
-            {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-            {"role": "user", "content": f"{part2_prompt}\n\n{part2}"},
-        ])
-    except Exception as e:
-        print(f"[latex] error on part-2: {e}")
-        raise
-    # Retry once if the response doesn't look like LaTeX (missing key markers)
-    if r"\section" not in latex2_body and r"\subsection" not in latex2_body:
-        print(f"[latex] WARNING: part-2 doesn't look like LaTeX, retrying once. First 200 chars: {latex2_body[:200]}")
-        try:
-            latex2_body = _llama_call_with_fallback(client, [
-                {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-                {"role": "user", "content": f"{part2_prompt}\n\n{part2}"},
-            ])
-        except Exception as e:
-            print(f"[latex] retry on part-2 also failed: {e}")
-    print(f"[latex] part-2 done, length={len(latex2_body)}")
-
-    end_tag = r"\end{document}"
-    if end_tag in latex1:
-        merged = latex1.replace(end_tag, f"\n{latex2_body.strip()}\n{end_tag}", 1)
-    else:
-        merged = latex1 + "\n" + latex2_body.strip()
-
-    full_latex = LATEX_PREAMBLE + merged + LATEX_POSTAMBLE
-    print(f"[latex] merge done, total length={len(full_latex)}")
-    return {"subject": subject, "latex": full_latex}
+    full_body = "\n\n".join(body_sections)
+    full_latex = LATEX_PREAMBLE + full_body + LATEX_POSTAMBLE
+    print(f"[latex] all parts merged, total length={len(full_latex)}")
+    return {"subject": subject, "latex": full_latex}ِ
 
 
 def get_video_duration(url: str) -> float:
@@ -396,7 +335,7 @@ def get_video_duration(url: str) -> float:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "skip_download": True,
+        "skip_download": True,ِ
         "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
