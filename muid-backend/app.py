@@ -266,41 +266,45 @@ def _extract_body(latex_doc: str) -> str:
     return latex_doc.strip()
 
 
-def to_latex(transcription: str, client: Groq) -> dict:
-    """Convert transcription to LaTeX.
+    def to_latex(transcription: str, client: Groq) -> dict:
+        """Convert transcription to LaTeX.
 
-    Splits the transcript into small chunks (each under MAX_LATEX_CHARS)
-    so LLaMA can cover every detail without being forced to summarize.
-    """
-    print(f"[latex] transcript length={len(transcription)}, MAX_LATEX_CHARS={MAX_LATEX_CHARS}")
-    # Split into chunks of MAX_LATEX_CHARS, breaking at sentence boundaries where possible
-    parts = []
-    remaining = transcription
-    while remaining:
-        if len(remaining) <= MAX_LATEX_CHARS:
-           parts.append(remaining)
-           break
-        cut = remaining.rfind(".", 0, MAX_LATEX_CHARS)
-        if cut == -1 or cut < MAX_LATEX_CHARS // 2:
-           cut = MAX_LATEX_CHARS 
-        parts.append(remaining[:cut])
-        remaining = remaining[cut:]
-    print(f"[latex] split into {len(parts)} part(s) for full-detail conversion")
+        Splits the transcript into small chunks (each under MAX_LATEX_CHARS)
+        so LLaMA can cover every detail without being forced to summarize.
+        """
+        print(f"[latex] transcript length={len(transcription)}, MAX_LATEX_CHARS={MAX_LATEX_CHARS}")
 
-    subject = ""
-    body_sections = []
-    for i, part in enumerate(parts):
-        is_first = (i == 0)
-        part_label = f"part {i + 1} of {len(parts)}"
-        print(f"[latex] starting {part_label} conversion...")
-        if is_first:
-            user_content = f"Transcription ({part_label}):\n\n{part}"
-        else:
-            user_content = (
-                f"Continue converting the following Arabic transcription ({part_label}) "
-                f"into LaTeX body content. Return ONLY the LaTeX body — no SUBJECT line needed "
-                f"since it was already provided in part 1.\n\n{part}"
-            )
+        parts = []
+        remaining = transcription
+        while remaining:
+            if len(remaining) <= MAX_LATEX_CHARS:
+                parts.append(remaining)
+                break
+            cut = remaining.rfind(".", 0, MAX_LATEX_CHARS)
+            if cut == -1 or cut < MAX_LATEX_CHARS // 2:
+                cut = MAX_LATEX_CHARS
+            parts.append(remaining[:cut])
+            remaining = remaining[cut:]
+
+        print(f"[latex] split into {len(parts)} part(s) for full-detail conversion")
+
+        subject = ""
+        body_sections = []
+
+        for i, part in enumerate(parts):
+            is_first = (i == 0)
+            part_label = f"part {i + 1} of {len(parts)}"
+            print(f"[latex] starting {part_label} conversion...")
+
+            if is_first:
+                user_content = f"Transcription ({part_label}):\n\n{part}"
+            else:
+                user_content = (
+                    f"Continue converting the following Arabic transcription ({part_label}) "
+                    f"into LaTeX body content. Return ONLY the LaTeX body — no SUBJECT line needed "
+                    f"since it was already provided in part 1.\n\n{part}"
+                )
+
             try:
                 content = _llama_call_with_fallback(client, [
                     {"role": "system", "content": LATEX_SYSTEM_PROMPT},
@@ -312,7 +316,6 @@ def to_latex(transcription: str, client: Groq) -> dict:
 
             part_subject, part_body = _parse_latex_response(content)
 
-            # Retry once if this part doesn't look like proper LaTeX
             if r"\section" not in part_body and r"\subsection" not in part_body:
                 print(f"[latex] WARNING: {part_label} doesn't look like LaTeX, retrying once. First 200 chars: {part_body[:200]}")
                 try:
@@ -323,17 +326,17 @@ def to_latex(transcription: str, client: Groq) -> dict:
                     part_subject, part_body = _parse_latex_response(content)
                 except Exception as e:
                     print(f"[latex] retry on {part_label} also failed: {e}")
+
             if is_first and part_subject:
                 subject = part_subject
 
             body_sections.append(part_body)
             print(f"[latex] {part_label} done, length={len(part_body)}")
-    full_body = "\n\n".join(body_sections)
-    full_latex = LATEX_PREAMBLE + full_body + LATEX_POSTAMBLE
-    print(f"[latex] all parts merged, total length={len(full_latex)}")
-    return {"subject": subject, "latex": full_latex}
-        
 
+        full_body = "\n\n".join(body_sections)
+        full_latex = LATEX_PREAMBLE + full_body + LATEX_POSTAMBLE
+        print(f"[latex] all parts merged, total length={len(full_latex)}")
+        return {"subject": subject, "latex": full_latex}
     mid = len(transcription) // 2
     part1 = transcription[:mid]
     part2 = transcription[mid:]
