@@ -247,15 +247,21 @@ def _parse_latex_response(content: str) -> tuple[str, str]:
     """Extract subject and latex body from a LLaMA response."""
     subject = ""
     latex = ""
+    content = content.strip()
+
     if "SUBJECT:" in content and "LATEX:" in content:
         subject_part, latex_part = content.split("LATEX:", 1)
         subject = subject_part.replace("SUBJECT:", "").strip()
         latex = latex_part.strip()
+    elif content.startswith(r"\section") or content.startswith(r"\subsection") or r"\section" in content[:100] or r"\subsection" in content[:100]:
+        # Response is already valid LaTeX body content, just without the SUBJECT:/LATEX: markers
+        print(f"[latex-parse] INFO: response is raw LaTeX without markers, accepting as-is. First 100 chars: {content[:100]}")
+        latex = content
     else:
-        print(f"[latex-parse] WARNING: response missing SUBJECT:/LATEX: markers. First 200 chars: {content[:200]}")
+        print(f"[latex-parse] WARNING: response missing SUBJECT:/LATEX: markers and doesn't look like LaTeX. First 200 chars: {content[:200]}")
         latex = ""
-    return subject, latex
 
+    return subject, latex
 
 def to_latex(transcription: str, client: Groq) -> dict:
     """Convert transcription to LaTeX.
