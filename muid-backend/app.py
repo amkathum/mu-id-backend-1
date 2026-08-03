@@ -327,7 +327,7 @@ def to_latex(transcription: str, client: Groq) -> dict:
     full_body = "\n\n".join(body_sections)
     full_latex = LATEX_PREAMBLE + full_body + LATEX_POSTAMBLE
     print(f"[latex] all parts merged, total length={len(full_latex)}")
-    return {"subject": subject, "latex": full_latex}ِ
+    return {"subject": subject, "latex": full_latex}
 
 
 def get_video_duration(url: str) -> float:
@@ -335,7 +335,7 @@ def get_video_duration(url: str) -> float:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "skip_download": True,ِ
+        "skip_download": True,
         "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
