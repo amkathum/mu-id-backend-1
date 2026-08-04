@@ -55,8 +55,13 @@ LATEX_PREAMBLE = r"""\documentclass{article}
 \setotherlanguage{english}
 \usepackage{fontspec}
 \setmainfont{Amiri}
+\newfontfamily\arabicfonttt{Amiri}
 \usepackage{tcolorbox}
 \usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage[acronym]{glossaries}
+\makeglossaries
 \begin{document}
 """
 
