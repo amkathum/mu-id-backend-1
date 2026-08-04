@@ -262,6 +262,17 @@ def _parse_latex_response(content: str) -> tuple[str, str]:
         latex = ""
 
     return subject, latex
+def _sanitize_latex(latex: str) -> str:
+    """Fix common malformed environment names the model sometimes generates."""
+    fixes = {
+        r"\begin{itemcolorbox}": r"\begin{tcolorbox}",
+        r"\end{itemcolorbox}": r"\end{tcolorbox}",
+        r"\begin{itemtcolorbox}": r"\begin{tcolorbox}",
+        r"\end{itemtcolorbox}": r"\end{tcolorbox}",
+    }
+    for wrong, right in fixes.items():
+        latex = latex.replace(wrong, right)
+    return latex
 
 def to_latex(transcription: str, client: Groq) -> dict:
     """Convert transcription to LaTeX.
@@ -326,7 +337,7 @@ def to_latex(transcription: str, client: Groq) -> dict:
 
         if is_first and part_subject:
             subject = part_subject
-
+        part_body = _sanitize_latex(part_body)
         body_sections.append(part_body)
         print(f"[latex] {part_label} done, length={len(part_body)}")
 
