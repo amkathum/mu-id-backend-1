@@ -22,6 +22,7 @@ app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB max upload
 # ---------------------------------------------------------------------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "")
 MAX_CHUNK_MS = 8 * 60 * 1000   # 8 minutes in milliseconds
 MAX_LATEX_CHARS = 2000           # max chars sent to LLaMA per call
 JOB_TTL = 7200                   # seconds before a completed job is purged (2 hours)
@@ -236,12 +237,20 @@ def _llama_call_with_fallback(client: Groq, messages: list[dict]) -> str:
         error_str = str(e)
         if "rate_limit" in error_str or "413" in error_str or "429" in error_str:
             print(f"[fallback] Groq limit hit ({error_str[:100]}), trying OpenRouter...")
-            try:
-                return _openrouter_call(messages, model="deepseek/deepseek-v4-flash:free")
-            except Exception as e2:
-                print(f"[fallback] OpenRouter deepseek failed ({str(e2)[:100]}), trying gpt-oss...")
-                return _openrouter_call(messages, model="openai/gpt-oss-120b:free")
+            for model_name in [
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "nvidia/nemotron-3-super-120b-a12b:free",
+                "openai/gpt-oss-20b:free",
+            ]:
+                try:
+                    print(f"[fallback] Trying {model_name}...")
+                    return _openrouter_call(messages, model=model_name)
+                except Exception as e2:
+                    print(f"[fallback] {model_name} failed ({str(e2)[:100]})")
+                    continue
+            raise Exception("All OpenRouter fallback models failed")
         raise
+
 
 def _parse_latex_response(content: str) -> tuple[str, str]:
     """Extract subject and latex body from a LLaMA response."""
@@ -254,7 +263,6 @@ def _parse_latex_response(content: str) -> tuple[str, str]:
         subject = subject_part.replace("SUBJECT:", "").strip()
         latex = latex_part.strip()
     elif content.startswith(r"\section") or content.startswith(r"\subsection") or r"\section" in content[:100] or r"\subsection" in content[:100]:
-        # Response is already valid LaTeX body content, just without the SUBJECT:/LATEX: markers
         print(f"[latex-parse] INFO: response is raw LaTeX without markers, accepting as-is. First 100 chars: {content[:100]}")
         latex = content
     else:
@@ -262,6 +270,8 @@ def _parse_latex_response(content: str) -> tuple[str, str]:
         latex = ""
 
     return subject, latex
+
+
 def _sanitize_latex(latex: str) -> str:
     """Fix common malformed environment names the model sometimes generates."""
     fixes = {
@@ -273,6 +283,7 @@ def _sanitize_latex(latex: str) -> str:
     for wrong, right in fixes.items():
         latex = latex.replace(wrong, right)
     return latex
+
 
 def to_latex(transcription: str, client: Groq) -> dict:
     """Convert transcription to LaTeX.
@@ -347,8 +358,19 @@ def to_latex(transcription: str, client: Groq) -> dict:
     return {"subject": subject, "latex": full_latex}
 
 
+def _write_cookies_file() -> str | None:
+    """Write YOUTUBE_COOKIES env var to a temp file for yt-dlp to use."""
+    if not YOUTUBE_COOKIES:
+        return None
+    cookies_path = "/tmp/youtube_cookies.txt"
+    with open(cookies_path, "w", encoding="utf-8") as f:
+        f.write(YOUTUBE_COOKIES)
+    return cookies_path
+
+
 def get_video_duration(url: str) -> float:
     """Return video duration in seconds without downloading the file."""
+    cookies_file = _write_cookies_file()
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -361,6 +383,8 @@ def get_video_duration(url: str) -> float:
             }
         },
     }
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         return float(info.get("duration") or 0)
@@ -368,6 +392,7 @@ def get_video_duration(url: str) -> float:
 
 def download_youtube_audio(url: str, tmp_dir: Path) -> Path:
     """Download best-audio from a YouTube URL, extract to MP3."""
+    cookies_file = _write_cookies_file()
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": str(tmp_dir / "audio.%(ext)s"),
@@ -387,6 +412,8 @@ def download_youtube_audio(url: str, tmp_dir: Path) -> Path:
         "no_warnings": False,
         "ignoreerrors": False,
     }
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
