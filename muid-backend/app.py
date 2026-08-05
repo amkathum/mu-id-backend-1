@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import threading
 import time
+import re
 from pathlib import Path
 
 from flask import Flask, request, jsonify
@@ -60,8 +61,6 @@ LATEX_PREAMBLE = r"""\documentclass{article}
 \usepackage{xcolor}
 \usepackage{booktabs}
 \usepackage{url}
-\usepackage[acronym]{glossaries}
-\makeglossaries
 \begin{document}
 """
 
@@ -278,7 +277,7 @@ def _parse_latex_response(content: str) -> tuple[str, str]:
 
 
 def _sanitize_latex(latex: str) -> str:
-    """Fix common malformed environment names the model sometimes generates."""
+    """Fix common malformed environment names and undefined commands the model sometimes generates."""
     fixes = {
         r"\begin{itemcolorbox}": r"\begin{tcolorbox}",
         r"\end{itemcolorbox}": r"\end{tcolorbox}",
@@ -287,6 +286,10 @@ def _sanitize_latex(latex: str) -> str:
     }
     for wrong, right in fixes.items():
         latex = latex.replace(wrong, right)
+    # Remove undefined acronym commands (glossaries package not configured)
+    latex = re.sub(r"\\acrfull\{([^}]+)\}", lambda m: m.group(1).upper(), latex)
+    latex = re.sub(r"\\acrshort\{([^}]+)\}", lambda m: m.group(1).upper(), latex)
+    latex = re.sub(r"\\acrlong\{([^}]+)\}", lambda m: m.group(1).upper(), latex)
     return latex
 
 
